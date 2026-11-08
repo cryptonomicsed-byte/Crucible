@@ -1,0 +1,31 @@
+[Unit]
+Description=Crucible MCP server (falsifiable-claims oracle seam)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ares/Crucible
+# The release binary built by deploy/install.sh; the MCP wrapper (zero-dep
+# Node) finds it via CRUCIBLE_BIN and forks one `crucible <verb>` per call.
+Environment=CRUCIBLE_BIN=/opt/ares/Crucible/target/release/crucible
+Environment=CRUCIBLE_TIMEOUT_MS=20000
+Environment=CRUCIBLE_MAX_CONCURRENT=4
+Environment=CRUCIBLE_FALSIFIER_DIR=/opt/ares/Crucible/falsifiers
+ExecStart=/usr/bin/node /opt/ares/Crucible/mcp/crucible-mcp.mjs
+# stdio MCP: the accepted socket connection becomes stdin/stdout (see
+# ares-crucible.socket). A client (Vantage P3-01, minipae P3-08) connects to
+# the unix socket and speaks JSON-RPC MCP. No TCP port, no credentials on the
+# wire: the oracle seam is only reachable on the box's own filesystem.
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=sockets.target

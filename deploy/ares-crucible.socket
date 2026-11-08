@@ -1,0 +1,16 @@
+[Unit]
+Description=Crucible MCP socket (single persistent instance)
+
+[Socket]
+# One persistent MCP server instance; the connection is handed to the service
+# as stdin/stdout. Accept=no means the server is not re-spawned per connection
+# and a second simultaneous client queues behind the first (fine: Vantage is
+# the primary consumer, and a single caller keeps MCP state coherent).
+ListenStream=/run/ares-crucible.sock
+Accept=no
+SocketMode=0660
+SocketUser=ares
+SocketGroup=ares
+
+[Install]
+WantedBy=sockets.target

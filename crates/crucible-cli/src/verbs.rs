@@ -1072,6 +1072,32 @@ pub fn keygen(input: &Value) -> Result<Value> {
     }))
 }
 
+/// A real, freshly-random secp256k1 keypair from the OS CSPRNG (P1-17).
+///
+/// Unlike `keygen`, this is not reproducible and is not gated behind
+/// CRUCIBLE_ALLOW_DEMO_KEYS: it exists so an operator can generate the
+/// resolver (oracle) key *on the VPS* and keep the secret there. The caller is
+/// responsible for writing the secret to a 0600 file; Crucible never stores it.
+pub fn keygen_live(_input: &Value) -> Result<Value> {
+    let mut material = [0u8; 32];
+    getrandom::getrandom(&mut material).map_err(|e| anyhow!("OS randomness unavailable: {e}"))?;
+    let sk = loop {
+        match k256::schnorr::SigningKey::from_bytes(&material) {
+            Ok(k) => break k,
+            // Vanishingly unlikely; draw again rather than fail.
+            Err(_) => {
+                getrandom::getrandom(&mut material)
+                    .map_err(|e| anyhow!("OS randomness unavailable: {e}"))?;
+            }
+        }
+    };
+    Ok(json!({
+        "secret_key": hex::encode(sk.to_bytes()),
+        "pubkey": hex::encode(sk.verifying_key().to_bytes()),
+        "warning": "real random key; the secret must never leave this host",
+    }))
+}
+
 // ---------------------------------------------------------- self-description
 
 /// The catalogue every other surface is generated from.
@@ -1174,6 +1200,11 @@ pub fn tools() -> Value {
                 "summary": "Derive a reproducible demo keypair from a seed. Gated behind CRUCIBLE_ALLOW_DEMO_KEYS. Not an identity to trust.",
                 "input": {"seed": "string"},
             },
+            {
+                "name": "keygen.live",
+                "summary": "Generate a real, fresh random secp256k1 keypair from the OS CSPRNG. For the resolver/oracle key, generated on the VPS; the caller keeps the secret.",
+                "input": {},
+            },
         ],
     })
 }
@@ -1196,6 +1227,7 @@ pub fn dispatch(verb: &str, input: &Value) -> Result<Value> {
         "event.verify" => event_verify(input),
         "event.sign" => event_sign(input),
         "keygen" => keygen(input),
+        "keygen.live" => keygen_live(input),
         other => {
             let catalogue = tools();
             let known: Vec<&str> = catalogue["verbs"]
@@ -1294,7 +1326,23 @@ mod tests {
         sign(&out["attestation"], &sk)
     }
 
-    #[test]
+        #[test]
+    fn keygen_live_produces_a_fresh_real_key() {
+        // Not gated behind demo keys: a resolver key must be available in a
+        // live deployment. Two calls give two different, well-formed keys.
+        let a = keygen_live(&json!({})).unwrap();
+        let b = keygen_live(&json!({})).unwrap();
+        assert_ne!(a["pubkey"], b["pubkey"]);
+        assert_ne!(a["secret_key"], b["secret_key"]);
+        for doc in [&a, &b] {
+            let pk = doc["pubkey"].as_str().unwrap();
+            let sk = doc["secret_key"].as_str().unwrap();
+            assert_eq!(hex::decode(pk).unwrap().len(), 32, "x-only pubkey is 32 bytes");
+            assert_eq!(hex::decode(sk).unwrap().len(), 32, "secret key is 32 bytes");
+        }
+    }
+
+#[test]
     fn the_catalogue_describes_every_verb_that_exists() {
         let listed: Vec<String> = tools()["verbs"]
             .as_array()
