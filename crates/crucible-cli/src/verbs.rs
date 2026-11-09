@@ -2456,3 +2456,106 @@ mod exogenous_ground_truth {
         assert!(err.contains("experiment"), "got {err}");
     }
 }
+
+
+/// P3-01: the trading falsifier Vantage's adapter builds its claims on.
+/// A signal is a claim, a confirming source is an attestation that observed
+/// its own call (`hit`), and the resolver's 47010 answers from the market.
+#[cfg(test)]
+mod trading_signal_tests {
+    use super::tests::{keys, sandbox, sign};
+    use super::*;
+
+    const SIGNAL_OUTCOME: &str = "signal-outcome.wat";
+
+    fn manifest() -> Value {
+        sandbox();
+        json!({"observations": ["signal:outcome"], "fuel": 50_000_000, "memory_pages": 64, "max_output": 8192})
+    }
+
+    fn inputs() -> Value {
+        json!({
+            "record_id": "01JTESTRECORD0000000000000", "source": "alpha_daemon",
+            "chain": "solana", "address": "So11111111111111111111111111111111111111112",
+            "symbol": "SOL", "direction": "long", "entry_price_usd": 150.0,
+            "window": "24h", "threshold_pct": 1.0,
+        })
+    }
+
+    fn outcome_for(observed: Option<&str>) -> String {
+        let mut req = json!({"manifest": manifest(), "module_path": SIGNAL_OUTCOME, "inputs": inputs()});
+        if let Some(v) = observed {
+            req["observations"] = json!({"signal:outcome": v});
+        }
+        probe_run(&req).unwrap()["outcome"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_falsifier_reads_hit_miss_and_says_so_when_it_cannot_see() {
+        assert_eq!(outcome_for(Some("hit")), "holds");
+        assert_eq!(outcome_for(Some("miss")), "fails");
+        assert_eq!(outcome_for(None), "indeterminate", "an unmarked window is not a miss");
+        assert_eq!(outcome_for(Some("hi")), "indeterminate");
+        assert_eq!(outcome_for(Some("hits")), "indeterminate");
+        assert_eq!(outcome_for(Some("maybe-later")), "indeterminate");
+    }
+
+    #[test]
+    fn it_is_observational_so_claim_build_needs_no_vacuity_pass() {
+        let (_, pk) = keys("signal-author");
+        let built = claim_build(&json!({
+            "pubkey": pk, "created_at": 1_700_000_000u64, "community": "vantage-trading",
+            "domain": "trading", "statement": "SOL long beats +1% at +24h", "confidence": 0.62,
+            "half_life": 86_400, "inputs": inputs(), "manifest": manifest(), "module_path": SIGNAL_OUTCOME,
+        }))
+        .unwrap();
+        assert_eq!(built["pure"], json!(false));
+        assert_eq!(built["event"]["kind"], json!(kinds::CLAIM));
+    }
+
+    /// Two sources confirm the call; the resolver's oracle verdict says the
+    /// move did not happen. The oracle governs, and names itself.
+    #[test]
+    fn confirmations_attest_one_claim_and_the_resolver_oracle_settles_it() {
+        let at = 1_700_000_000u64;
+        let (author_sk, author_pk) = keys("signal-author");
+        let built = claim_build(&json!({
+            "pubkey": author_pk, "created_at": at, "community": "vantage-trading",
+            "domain": "trading", "statement": "SOL long beats +1% at +24h", "confidence": 0.62,
+            "half_life": 86_400, "inputs": inputs(), "manifest": manifest(), "module_path": SIGNAL_OUTCOME,
+        }))
+        .unwrap();
+        let claim = sign(&built["event"], &author_sk);
+        let experiment = built["experiment"].as_str().unwrap().to_string();
+        let mut events = vec![claim.clone()];
+        for (i, seed) in ["confirm-a", "confirm-b"].iter().enumerate() {
+            let (sk, pk) = keys(seed);
+            let out = probe_run(&json!({
+                "manifest": manifest(), "module_path": SIGNAL_OUTCOME, "inputs": inputs(),
+                "observations": {"signal:outcome": "hit"},
+                "claim": claim["id"], "experiment": experiment,
+                "pubkey": pk, "created_at": at + 60 * (i as u64 + 1),
+                "lineage": format!("source:{seed}"), "env": "vantage", "blind": false,
+            }))
+            .unwrap();
+            assert_eq!(out["attestation"]["kind"], json!(kinds::ATTESTATION));
+            events.push(sign(&out["attestation"], &sk));
+        }
+        let (oracle_sk, oracle_pk) = keys("resolver");
+        let ov = oracle_verdict(&json!({
+            "pubkey": oracle_pk, "created_at": at + 86_400, "claim": claim["id"],
+            "experiment": experiment, "outcome": "fails",
+        }))
+        .unwrap();
+        events.push(sign(&ov["event"], &oracle_sk));
+
+        let policy = json!({"allow_unrostered": true, "oracle_authorities": [oracle_pk]});
+        let out = resolve_verb(&json!({
+            "events": events, "claim": claim["id"], "now": at + 86_400 + 60,
+            "policy": policy, "verify_signatures": true,
+        }))
+        .unwrap();
+        assert_eq!(out["resolution"]["verdict"]["status"], json!("refuted"));
+        assert_eq!(out["resolution"]["oracle"], json!(oracle_pk));
+    }
+}
